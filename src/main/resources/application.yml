@@ -70,6 +70,21 @@ spring:
 # 业务自定义配置：数据库工具能力
 # ==========================
 app:
+  # ==========================
+  # MCP keep-alive 优化（断连会话自动清理）
+  # ==========================
+  # 背景：
+  # - MCP SDK 默认 keep-alive 失败后只会打印告警，不会自动移除会话
+  # - 当 Codex/客户端异常断开时，服务端可能持续尝试 ping，导致日志刷屏与无效任务占用资源
+  # 本项目通过补丁逻辑：ping 失败/超时后主动关闭并移除会话，避免“僵尸会话”长期存在
+  mcp:
+    keep-alive:
+      enabled: true
+      # ping 发送超时时间（超过则认为连接异常并清理会话）
+      ping-timeout: 20s
+      # ping 失败是否立即清理会话（建议 true）
+      cleanup-on-failure: true
+
   db:
     # 默认数据源ID（工具未传 dataSourceId 时使用）
     default-data-source: primary
