@@ -1,587 +1,259 @@
 package org.example.db.sql;
 
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Set;
+import com.alibaba.druid.DbType;
+import com.alibaba.druid.sql.SQLUtils;
+import com.alibaba.druid.sql.ast.*;
+import com.alibaba.druid.sql.ast.expr.*;
+import com.alibaba.druid.sql.ast.statement.*;
+import com.alibaba.druid.sql.dialect.mysql.visitor.MySqlASTVisitor;
+import com.alibaba.druid.sql.dialect.oracle.visitor.OracleASTVisitor;
+import com.alibaba.druid.sql.dialect.postgresql.visitor.PGASTVisitor;
+import com.alibaba.druid.sql.dialect.sqlserver.visitor.SQLServerASTVisitor;
+import com.alibaba.druid.sql.dialect.postgresql.ast.stmt.PGSelectQueryBlock;
+import com.alibaba.druid.sql.dialect.mysql.ast.statement.MySqlSelectQueryBlock;
+import com.alibaba.druid.sql.visitor.SQLASTVisitorAdapter;
+import com.alibaba.druid.sql.parser.SQLParserUtils;
+import com.alibaba.druid.sql.parser.Token;
+import org.example.db.datasource.DatabaseType;
+import java.util.*;
 
-/**
- * SQL 字符串分析工具（轻量级、够用即可）。
- * <p>
- * 注意：
- * <ul>
- *   <li>这里不是完整 SQL Parser，只做“安全守卫 + 表名提取”的最小实现。</li>
- *   <li>复杂 SQL（多层子查询、函数表、动态 SQL）可能提取不完整，但不影响执行。</li>
- * </ul>
- */
+/** Dialect-aware, fail-closed validation. Only the validated, qualified AST is executed. */
 public final class SqlUtils {
+    private SqlUtils() {}
 
-    private SqlUtils() {
+    public record CheckedSql(String sql, SqlStatementInfo info, List<TableRef> refs, boolean withoutWhere) {}
+
+    public static CheckedSql check(String sql, DatabaseType type, String defaultSchema,
+                                   List<String> allowedSchemas, Set<String> allowedFunctions, int maxLength) {
+        if (sql == null || sql.isBlank() || sql.length() > maxLength)
+            throw new IllegalArgumentException("SQL 不能为空，且长度不能超过 " + maxLength);
+        List<SQLStatement> statements;
+        try {
+            checkLexicalStructure(sql, dbType(type));
+            statements = SQLUtils.parseStatements(sql, dbType(type));
+        } catch (RuntimeException | StackOverflowError e) {
+            throw new IllegalArgumentException("SQL 无法按当前数据库方言安全解析");
+        }
+        if (statements.size() != 1) throw new IllegalArgumentException("仅允许单条 SQL");
+        SQLStatement statement = statements.getFirst();
+        statement.setAfterSemi(false); // JDBC drivers such as Oracle reject a trailing statement terminator.
+        SqlStatementInfo info = classify(statement);
+        if (info.category() == SqlCategory.OTHER) throw new IllegalArgumentException("不支持此 SQL 类型");
+        Guard guard = new Guard(statement, type, defaultSchema, allowedSchemas, allowedFunctions);
+        statement.accept(guard);
+        boolean withoutWhere = statement instanceof SQLUpdateStatement u && u.getWhere() == null
+                || statement instanceof SQLDeleteStatement d && d.getWhere() == null;
+        return new CheckedSql(SQLUtils.toSQLString(statement, dbType(type)), info, List.copyOf(guard.refs), withoutWhere);
     }
 
-    /**
-     * 是否包含多条语句（通过分号 ; 判断，且忽略引号内的分号）。
-     * <p>
-     * 出于安全考虑，本项目默认只允许单条语句：避免一次确认执行多条写入。
-     */
-    public static boolean hasMultipleStatements(String sql) {
-        if (sql == null) {
-            return false;
-        }
-
-        boolean inSingleQuote = false;
-        boolean inDoubleQuote = false;
-        String dollarDelimiter = null; // PostgreSQL $$ 或 $tag$
-
-        for (int i = 0; i < sql.length(); i++) {
-            char c = sql.charAt(i);
-
-            // Dollar-Quoted 字符串（只在不处于其他引号内时识别）
-            if (!inSingleQuote && !inDoubleQuote) {
-                if (dollarDelimiter == null && c == '$') {
-                    String delimiter = tryReadDollarDelimiter(sql, i);
-                    if (delimiter != null) {
-                        dollarDelimiter = delimiter;
-                        i += delimiter.length() - 1;
-                        continue;
-                    }
-                } else if (dollarDelimiter != null && sql.startsWith(dollarDelimiter, i)) {
-                    int delimiterLen = dollarDelimiter.length();
-                    dollarDelimiter = null;
-                    i += delimiterLen - 1;
-                    continue;
-                }
-            }
-            if (dollarDelimiter != null) {
-                continue;
-            }
-
-            // 单引号字符串
-            if (!inDoubleQuote && c == '\'') {
-                if (inSingleQuote) {
-                    // 处理转义：'' 表示单引号
-                    if (i + 1 < sql.length() && sql.charAt(i + 1) == '\'') {
-                        i++;
-                        continue;
-                    }
-                    inSingleQuote = false;
-                } else {
-                    inSingleQuote = true;
-                }
-                continue;
-            }
-
-            // 双引号标识符
-            if (!inSingleQuote && c == '"') {
-                if (inDoubleQuote) {
-                    if (i + 1 < sql.length() && sql.charAt(i + 1) == '"') {
-                        i++;
-                        continue;
-                    }
-                    inDoubleQuote = false;
-                } else {
-                    inDoubleQuote = true;
-                }
-                continue;
-            }
-
-            if (!inSingleQuote && !inDoubleQuote && c == ';') {
-                // 分号后还有非空白字符 -> 认为是多语句
-                for (int j = i + 1; j < sql.length(); j++) {
-                    if (!Character.isWhitespace(sql.charAt(j))) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
+    private static void checkLexicalStructure(String sql, DbType type) {
+        var lexer = SQLParserUtils.createLexer(sql, type);
+        lexer.setKeepComments(true);
+        int depth = 0;
+        do {
+            lexer.nextToken();
+            if (lexer.token() == Token.ERROR || lexer.token() == Token.HINT)
+                throw new IllegalArgumentException("不允许解析错误或执行提示");
+            var comments = lexer.readAndResetComments();
+            if (comments != null && comments.stream().anyMatch(c -> c.startsWith("/*!") || c.startsWith("/*M!") || c.startsWith("/*+")))
+                throw new IllegalArgumentException("不允许可执行注释");
+            if (lexer.token() == Token.LPAREN && ++depth > 64) throw new IllegalArgumentException("SQL 嵌套过深");
+            if (lexer.token() == Token.RPAREN) depth--;
+        } while (lexer.token() != Token.EOF);
     }
 
-    /**
-     * 粗略判定 SQL 的主关键字与类别。
-     */
-    public static SqlStatementInfo classify(String sql) {
-        String mainKeyword = findMainKeyword(sql);
-        if (mainKeyword == null) {
-            return new SqlStatementInfo("UNKNOWN", SqlCategory.OTHER);
-        }
-        String kw = mainKeyword.toUpperCase(Locale.ROOT);
-        return switch (kw) {
-            case "SELECT" -> new SqlStatementInfo(kw, SqlCategory.READ);
-            case "INSERT", "UPDATE", "DELETE", "MERGE" -> new SqlStatementInfo(kw, SqlCategory.WRITE_DML);
-            case "CREATE", "ALTER", "DROP", "TRUNCATE" -> new SqlStatementInfo(kw, SqlCategory.DDL);
-            default -> new SqlStatementInfo(kw, SqlCategory.OTHER);
+    public static DbType dbType(DatabaseType type) {
+        return switch (type) {
+            case POSTGRESQL -> DbType.postgresql;
+            case MYSQL -> DbType.mysql;
+            case ORACLE -> DbType.oracle;
+            case SQLSERVER -> DbType.sqlserver;
+            default -> throw new IllegalArgumentException("无法识别数据库方言");
         };
     }
 
-    /**
-     * 从 SQL 中提取可能涉及的表名（schema 可选）。
-     * <p>
-     * 仅作为“预加载表结构缓存”的辅助，提取不完整不会影响 SQL 执行。
-     */
-    public static List<TableRef> extractTableRefs(String sql) {
-        if (sql == null || sql.isBlank()) {
-            return List.of();
-        }
-
-        String normalized = sql;
-        Set<TableRef> result = new LinkedHashSet<>();
-
-        int len = normalized.length();
-        int parenDepth = 0;
-        boolean inSingle = false;
-        boolean inDouble = false;
-        String dollarDelimiter = null;
-
-        for (int i = 0; i < len; i++) {
-            char c = normalized.charAt(i);
-
-            // 处理 Dollar-Quoted
-            if (!inSingle && !inDouble) {
-                if (dollarDelimiter == null && c == '$') {
-                    String delimiter = tryReadDollarDelimiter(normalized, i);
-                    if (delimiter != null) {
-                        dollarDelimiter = delimiter;
-                        i += delimiter.length() - 1;
-                        continue;
-                    }
-                } else if (dollarDelimiter != null && normalized.startsWith(dollarDelimiter, i)) {
-                    int delimiterLen = dollarDelimiter.length();
-                    dollarDelimiter = null;
-                    i += delimiterLen - 1;
-                    continue;
-                }
-            }
-            if (dollarDelimiter != null) {
-                continue;
-            }
-
-            if (!inDouble && c == '\'') {
-                if (inSingle) {
-                    if (i + 1 < len && normalized.charAt(i + 1) == '\'') {
-                        i++;
-                    } else {
-                        inSingle = false;
-                    }
-                } else {
-                    inSingle = true;
-                }
-                continue;
-            }
-
-            if (!inSingle && c == '"') {
-                if (inDouble) {
-                    if (i + 1 < len && normalized.charAt(i + 1) == '"') {
-                        i++;
-                    } else {
-                        inDouble = false;
-                    }
-                } else {
-                    inDouble = true;
-                }
-                continue;
-            }
-
-            if (inSingle || inDouble) {
-                continue;
-            }
-
-            if (c == '(') {
-                parenDepth++;
-                continue;
-            }
-            if (c == ')') {
-                parenDepth = Math.max(0, parenDepth - 1);
-                continue;
-            }
-
-            if (parenDepth != 0) {
-                continue;
-            }
-
-            // 在顶层（parenDepth=0）查找关键字：FROM/JOIN/UPDATE/INTO/DELETE FROM
-            if (isWordAt(normalized, i, "FROM")) {
-                i = readTableAfterKeyword(normalized, i + 4, result);
-            } else if (isWordAt(normalized, i, "JOIN")) {
-                i = readTableAfterKeyword(normalized, i + 4, result);
-            } else if (isWordAt(normalized, i, "UPDATE")) {
-                i = readTableAfterKeyword(normalized, i + 6, result);
-            } else if (isWordAt(normalized, i, "INTO")) {
-                i = readTableAfterKeyword(normalized, i + 4, result);
-            } else if (isWordAt(normalized, i, "DELETE")) {
-                // DELETE FROM t ... -> 这里跳过 DELETE 后可能的 FROM
-                int j = skipSpaces(normalized, i + 6);
-                if (isWordAt(normalized, j, "FROM")) {
-                    i = readTableAfterKeyword(normalized, j + 4, result);
-                }
-            }
-        }
-
-        return new ArrayList<>(result);
+    private static SqlStatementInfo classify(SQLStatement statement) {
+        if (statement instanceof SQLSelectStatement) return new SqlStatementInfo("SELECT", SqlCategory.READ);
+        if (statement instanceof SQLInsertStatement) return new SqlStatementInfo("INSERT", SqlCategory.WRITE_DML);
+        if (statement instanceof SQLUpdateStatement) return new SqlStatementInfo("UPDATE", SqlCategory.WRITE_DML);
+        if (statement instanceof SQLDeleteStatement) return new SqlStatementInfo("DELETE", SqlCategory.WRITE_DML);
+        if (statement instanceof SQLMergeStatement) return new SqlStatementInfo("MERGE", SqlCategory.WRITE_DML);
+        if (statement instanceof SQLCreateTableStatement) return new SqlStatementInfo("CREATE", SqlCategory.DDL);
+        if (statement instanceof SQLAlterTableStatement) return new SqlStatementInfo("ALTER", SqlCategory.DDL);
+        if (statement instanceof SQLDropTableStatement) return new SqlStatementInfo("DROP", SqlCategory.DDL);
+        if (statement instanceof SQLTruncateStatement) return new SqlStatementInfo("TRUNCATE", SqlCategory.DDL);
+        return new SqlStatementInfo("UNSUPPORTED", SqlCategory.OTHER);
     }
 
-    private static int readTableAfterKeyword(String sql, int indexAfterKeyword, Set<TableRef> out) {
-        int i = skipSpaces(sql, indexAfterKeyword);
-
-        // PostgreSQL: FROM ONLY table
-        if (isWordAt(sql, i, "ONLY")) {
-            i = skipSpaces(sql, i + 4);
-        }
-
-        // 子查询：FROM (SELECT ...) alias -> 不提取
-        if (i < sql.length() && sql.charAt(i) == '(') {
-            return i;
-        }
-
-        // 读取 schema.table 或 table
-        IdentifierToken firstToken = readIdentifierToken(sql, i);
-        if (firstToken == null) {
-            return i;
-        }
-
-        List<String> parts = new ArrayList<>();
-        parts.add(firstToken.value());
-        i += firstToken.rawLength();
-
-        while (true) {
-            int beforeDot = i;
-            i = skipSpaces(sql, i);
-            if (i >= sql.length() || sql.charAt(i) != '.') {
-                i = beforeDot;
-                break;
-            }
-            i++; // consume '.'
-            IdentifierToken nextToken = readIdentifierToken(sql, i);
-            if (nextToken == null) {
-                i = beforeDot;
-                break;
-            }
-            parts.add(nextToken.value());
-            i += nextToken.rawLength();
-            // 限制最多识别 4 段，避免解析过深
-            if (parts.size() >= 4) {
-                break;
-            }
-        }
-
-        String schema = null;
-        String table;
-        if (parts.size() == 1) {
-            table = parts.get(0);
-        } else if (parts.size() == 2) {
-            schema = parts.get(0);
-            table = parts.get(1);
-        } else {
-            // 三段及以上：取最后两段作为 schema.table（常见于 SQLServer 的 db.schema.table）
-            schema = parts.get(parts.size() - 2);
-            table = parts.get(parts.size() - 1);
-        }
-
-        out.add(new TableRef(schema, table));
-        return i;
+    public static String identifier(String raw, DatabaseType type) {
+        if (raw == null || raw.isBlank()) throw new IllegalArgumentException("对象名不能为空");
+        if (raw.startsWith("\"") && raw.endsWith("\"")) return raw.substring(1, raw.length() - 1).replace("\"\"", "\"");
+        String tick = Character.toString(96);
+        if (raw.startsWith(tick) && raw.endsWith(tick)) return raw.substring(1, raw.length() - 1).replace(tick + tick, tick);
+        if (raw.startsWith("[") && raw.endsWith("]")) return raw.substring(1, raw.length() - 1).replace("]]", "]");
+        return switch (type) {
+            case POSTGRESQL -> raw.toLowerCase(Locale.ROOT);
+            case ORACLE -> raw.toUpperCase(Locale.ROOT);
+            default -> raw;
+        };
     }
 
-    private static String findMainKeyword(String sql) {
-        if (sql == null) {
-            return null;
-        }
-        String s = stripLeadingComments(sql).trim();
-        if (s.isEmpty()) {
-            return null;
-        }
-
-        String first = readFirstWord(s, 0);
-        if (first == null) {
-            return null;
-        }
-        if (!first.equalsIgnoreCase("WITH")) {
-            return first;
-        }
-
-        // WITH 语句：找到顶层（不在括号/引号内）的第一个 SELECT/INSERT/UPDATE/DELETE/MERGE
-        int parenDepth = 0;
-        boolean inSingle = false;
-        boolean inDouble = false;
-        String dollarDelimiter = null;
-
-        for (int i = first.length(); i < s.length(); i++) {
-            char c = s.charAt(i);
-
-            // Dollar-Quoted
-            if (!inSingle && !inDouble) {
-                if (dollarDelimiter == null && c == '$') {
-                    String delimiter = tryReadDollarDelimiter(s, i);
-                    if (delimiter != null) {
-                        dollarDelimiter = delimiter;
-                        i += delimiter.length() - 1;
-                        continue;
-                    }
-                } else if (dollarDelimiter != null && s.startsWith(dollarDelimiter, i)) {
-                    int delimiterLen = dollarDelimiter.length();
-                    dollarDelimiter = null;
-                    i += delimiterLen - 1;
-                    continue;
-                }
-            }
-            if (dollarDelimiter != null) {
-                continue;
-            }
-
-            if (!inDouble && c == '\'') {
-                if (inSingle) {
-                    if (i + 1 < s.length() && s.charAt(i + 1) == '\'') {
-                        i++;
-                    } else {
-                        inSingle = false;
-                    }
-                } else {
-                    inSingle = true;
-                }
-                continue;
-            }
-
-            if (!inSingle && c == '"') {
-                if (inDouble) {
-                    if (i + 1 < s.length() && s.charAt(i + 1) == '"') {
-                        i++;
-                    } else {
-                        inDouble = false;
-                    }
-                } else {
-                    inDouble = true;
-                }
-                continue;
-            }
-
-            if (inSingle || inDouble) {
-                continue;
-            }
-
-            if (c == '(') {
-                parenDepth++;
-                continue;
-            }
-            if (c == ')') {
-                parenDepth = Math.max(0, parenDepth - 1);
-                continue;
-            }
-
-            if (parenDepth != 0) {
-                continue;
-            }
-
-            if (isWordAt(s, i, "SELECT")) {
-                return "SELECT";
-            }
-            if (isWordAt(s, i, "INSERT")) {
-                return "INSERT";
-            }
-            if (isWordAt(s, i, "UPDATE")) {
-                return "UPDATE";
-            }
-            if (isWordAt(s, i, "DELETE")) {
-                return "DELETE";
-            }
-            if (isWordAt(s, i, "MERGE")) {
-                return "MERGE";
-            }
-        }
-
-        return null;
+    public static boolean schemaAllowed(String schema, String defaultSchema, List<String> allowed) {
+        List<String> effective = allowed == null || allowed.isEmpty() ? List.of(defaultSchema) : allowed;
+        // Do not merge distinct quoted schemas or case-sensitive database names.
+        return effective.contains("*") || effective.contains(schema);
     }
 
-    private static String stripLeadingComments(String sql) {
-        int i = 0;
-        while (i < sql.length()) {
-            // skip whitespace
-            while (i < sql.length() && Character.isWhitespace(sql.charAt(i))) {
-                i++;
-            }
-            if (i >= sql.length()) {
-                return "";
-            }
-            // line comment --
-            if (sql.startsWith("--", i)) {
-                int newline = sql.indexOf('\n', i + 2);
-                if (newline < 0) {
-                    return "";
-                }
-                i = newline + 1;
-                continue;
-            }
-            // block comment /* */
-            if (sql.startsWith("/*", i)) {
-                int end = sql.indexOf("*/", i + 2);
-                if (end < 0) {
-                    return "";
-                }
-                i = end + 2;
-                continue;
-            }
-            break;
-        }
-        return sql.substring(i);
+    private static String quote(String name, DatabaseType type) {
+        String tick = Character.toString(96);
+        return switch (type) {
+            case MYSQL -> tick + name.replace(tick, tick + tick) + tick;
+            case SQLSERVER -> "[" + name.replace("]", "]]") + "]";
+            default -> "\"" + name.replace("\"", "\"\"") + "\"";
+        };
     }
 
-    private static int skipSpaces(String s, int i) {
-        while (i < s.length() && Character.isWhitespace(s.charAt(i))) {
-            i++;
-        }
-        return i;
-    }
+    private static final class Guard extends SQLASTVisitorAdapter
+            implements MySqlASTVisitor, OracleASTVisitor, PGASTVisitor, SQLServerASTVisitor {
+        private final SQLStatement root;
+        private final DatabaseType type;
+        private final String defaultSchema;
+        private final List<String> allowed;
+        private final Set<String> functions;
+        private final Set<TableRef> refs = new LinkedHashSet<>();
+        private int depth;
 
-    private static boolean isWordAt(String s, int index, String wordUpper) {
-        int end = index + wordUpper.length();
-        if (index < 0 || end > s.length()) {
-            return false;
+        private Guard(SQLStatement root, DatabaseType type, String defaultSchema,
+                      List<String> allowed, Set<String> functions) {
+            this.root = root;
+            this.type = type;
+            this.defaultSchema = defaultSchema;
+            this.allowed = allowed;
+            this.functions = new HashSet<>();
+            for (String function : functions) this.functions.add(function.strip().toLowerCase(Locale.ROOT));
         }
-        if (!s.regionMatches(true, index, wordUpper, 0, wordUpper.length())) {
-            return false;
-        }
-        boolean leftOk = index == 0 || !Character.isLetterOrDigit(s.charAt(index - 1)) && s.charAt(index - 1) != '_';
-        boolean rightOk = end == s.length() || !Character.isLetterOrDigit(s.charAt(end)) && s.charAt(end) != '_';
-        return leftOk && rightOk;
-    }
 
-    private static String readFirstWord(String s, int i) {
-        i = skipSpaces(s, i);
-        int start = i;
-        while (i < s.length()) {
-            char c = s.charAt(i);
-            if (Character.isLetter(c)) {
-                i++;
+        @Override
+        public void preVisit(SQLObject node) {
+            if (++depth > 128) reject("SQL 嵌套过深");
+            if (node instanceof SQLSelectItem item && item.getAlias() != null
+                    && Set.of("select", "insert", "update", "delete", "merge", "create", "alter", "drop",
+                    "truncate", "exec", "execute", "with").contains(item.getAlias().toLowerCase(Locale.ROOT)))
+                reject("存在有歧义的关键字别名，请为列名加引号");
+            if (node.getClass().getSimpleName().endsWith("Hint")) reject("不允许表提示或执行提示");
+            if (node instanceof SQLTableSource source && source.getHints() != null && !source.getHints().isEmpty())
+                reject("不允许表提示或执行提示");
+            if (node instanceof SQLStatement nested && nested != root && !(nested instanceof SQLSelectStatement))
+                reject("不允许嵌套写入或可执行语句");
+            if (node instanceof SQLSelectQueryBlock block) {
+                if (block.getInto() != null || block.isForUpdate()) reject("不允许 SELECT INTO / 加锁查询");
+                if (block instanceof PGSelectQueryBlock pg && pg.getForClause() != null) reject("不允许加锁查询");
+                if (block instanceof MySqlSelectQueryBlock mysql && mysql.isLockInShareMode()) reject("不允许加锁查询");
+            }
+            if (node instanceof SQLMethodInvokeExpr method) validateFunction(method);
+            if (node instanceof SQLAggregateExpr aggregate
+                    && !functions.contains(aggregate.getMethodName().toLowerCase(Locale.ROOT)))
+                reject("聚合函数未在允许列表中: " + aggregate.getMethodName());
+            if (node instanceof SQLVariantRefExpr || node instanceof SQLSequenceExpr)
+                reject("不允许会话变量、占位符或序列操作");
+            if (node instanceof SQLTableSource && !(node instanceof SQLExprTableSource)
+                    && !(node instanceof SQLJoinTableSource) && !(node instanceof SQLSubqueryTableSource)
+                    && !(node instanceof SQLUnionQueryTableSource) && !(node instanceof SQLWithSubqueryClause.Entry))
+                reject("不支持此表来源（表函数、远程对象等）");
+            if (node instanceof SQLAlterTableItem) {
+                String kind = node.getClass().getSimpleName();
+                if (!Set.of("SQLAlterTableAddColumn", "SQLAlterTableDropColumnItem", "SQLAlterTableAlterColumn",
+                        "SQLAlterTableModifyColumn", "SQLAlterTableAddConstraint", "SQLAlterTableDropConstraint",
+                        "SQLAlterTableDropIndex", "SQLAlterTableAddIndex").contains(kind))
+                    reject("暂不支持此 ALTER TABLE 操作: " + kind);
+            }
+            if (node instanceof SQLExprTableSource table) validateTable(table);
+        }
+
+        @Override
+        public void postVisit(SQLObject node) { depth--; }
+
+        private String validateFunction(SQLMethodInvokeExpr method) {
+            String name = method.getMethodName().toLowerCase(Locale.ROOT);
+            if (method.getOwner() == null && functions.contains(name)) return name;
+            if (method.getOwner() != null) {
+                String owner = method.getOwner().toString().toLowerCase(Locale.ROOT);
+                if (type == DatabaseType.POSTGRESQL && owner.equals("pg_catalog") && functions.contains(name))
+                    return name;
+                if (type == DatabaseType.ORACLE && (owner.equals("dbms_lob") || owner.equals("sys.dbms_lob"))
+                        && Set.of("substr", "getlength", "instr").contains(name)
+                        && functions.contains("dbms_lob." + name))
+                    return "dbms_lob." + name;
+                name = owner + "." + name;
+            }
+            reject("函数未在允许列表中: " + name);
+            return name;
+        }
+
+        private boolean isQueryTableFunction(SQLMethodInvokeExpr method) {
+            String name = validateFunction(method);
+            return switch (type) {
+                case POSTGRESQL -> Set.of("string_to_table", "regexp_split_to_table",
+                        "jsonb_path_query", "jsonb_path_query_tz").contains(name);
+                case SQLSERVER -> name.equals("string_split");
+                default -> false;
+            };
+        }
+
+        private void validateTable(SQLExprTableSource source) {
+            SQLExpr expr = source.getExpr();
+            if (expr instanceof SQLMethodInvokeExpr method) {
+                if (!(root instanceof SQLSelectStatement) || !isQueryTableFunction(method))
+                    reject("查询表来源仅支持已允许的文本拆分和 JSONPath 查询函数");
+                // Keep the function and visit all its arguments. They may contain subqueries
+                // whose physical tables must still be checked and schema-qualified.
+                return;
+            }
+            String schema = defaultSchema;
+            String table;
+            if (expr instanceof SQLIdentifierExpr id) {
+                table = identifier(id.getName(), type);
+                if (isCte(source, table)) return;
+                SQLTableSource from = root instanceof SQLUpdateStatement update ? update.getFrom()
+                        : root instanceof SQLDeleteStatement delete ? delete.getFrom() : null;
+                SQLTableSource target = root instanceof SQLUpdateStatement update ? update.getTableSource()
+                        : root instanceof SQLDeleteStatement delete ? delete.getTableSource() : null;
+                if (type == DatabaseType.SQLSERVER && source == target && from != null
+                        && from != source && from.findTableSource(id.getName()) != null) return;
+                if (table.equalsIgnoreCase("dual") && (type == DatabaseType.ORACLE || type == DatabaseType.MYSQL)
+                        && root instanceof SQLSelectStatement) return;
+            } else if (expr instanceof SQLPropertyExpr property && property.getOwner() instanceof SQLIdentifierExpr owner) {
+                schema = identifier(owner.getName(), type);
+                table = identifier(property.getName(), type);
             } else {
-                break;
+                reject("仅允许 table 或 schema.table；不允许跨 catalog、数据库链接或表函数");
+                return;
             }
+            if (!schemaAllowed(schema, defaultSchema, allowed)) reject("不允许访问 schema: " + schema);
+            refs.add(new TableRef(schema, table));
+            source.setExpr(new SQLPropertyExpr(new SQLIdentifierExpr(quote(schema, type)), quote(table, type)));
         }
-        if (i == start) {
-            return null;
-        }
-        return s.substring(start, i);
-    }
 
-    /**
-     * 读取一个“标识符 token”（允许未加引号或双引号）。
-     * <p>
-     * 注意：为了简化，这里只支持不含空格/特殊字符的标识符；复杂标识符会返回 null。
-     */
-    private static IdentifierToken readIdentifierToken(String s, int i) {
-        i = skipSpaces(s, i);
-        if (i >= s.length()) {
-            return null;
-        }
-        char c = s.charAt(i);
-        if (c == '"') {
-            int start = i;
-            i++;
-            StringBuilder sb = new StringBuilder();
-            while (i < s.length()) {
-                char cc = s.charAt(i);
-                if (cc == '"') {
-                    if (i + 1 < s.length() && s.charAt(i + 1) == '"') {
-                        // "" -> "
-                        sb.append('"');
-                        i += 2;
-                        continue;
-                    }
-                    // 结束引号
-                    i++; // consume ending quote
-                    String value = sb.toString();
-                    return new IdentifierToken(value, i - start);
+        private boolean isCte(SQLObject node, String name) {
+            SQLWithSubqueryClause.Entry currentEntry = null;
+            for (SQLObject parent = node.getParent(); parent != null; parent = parent.getParent()) {
+                if (parent instanceof SQLWithSubqueryClause.Entry entry) currentEntry = entry;
+                SQLWithSubqueryClause with = null;
+                if (parent instanceof SQLSelect select) with = select.getWithSubQuery();
+                else if (parent instanceof SQLUpdateStatement update) with = update.getWith();
+                else if (parent instanceof SQLDeleteStatement delete) with = delete.getWith();
+                else if (parent instanceof SQLInsertStatement insert) with = insert.getWith();
+                if (with == null) continue;
+                for (SQLWithSubqueryClause.Entry entry : with.getEntries()) {
+                    boolean self = entry == currentEntry;
+                    if (self && !Boolean.TRUE.equals(with.getRecursive()) && type != DatabaseType.SQLSERVER) break;
+                    if (identifier(entry.getAlias(), type).equals(name)) return true;
+                    if (self) break;
                 }
-                sb.append(cc);
-                i++;
             }
-            return null; // 引号不配对
+            return false;
         }
 
-        // MySQL: `identifier`
-        if (c == '`') {
-            int start = i;
-            i++;
-            StringBuilder sb = new StringBuilder();
-            while (i < s.length()) {
-                char cc = s.charAt(i);
-                if (cc == '`') {
-                    // `` -> `
-                    if (i + 1 < s.length() && s.charAt(i + 1) == '`') {
-                        sb.append('`');
-                        i += 2;
-                        continue;
-                    }
-                    i++; // consume ending `
-                    return new IdentifierToken(sb.toString(), i - start);
-                }
-                sb.append(cc);
-                i++;
-            }
-            return null;
-        }
-
-        // SQLServer: [identifier]
-        if (c == '[') {
-            int start = i;
-            i++;
-            StringBuilder sb = new StringBuilder();
-            while (i < s.length()) {
-                char cc = s.charAt(i);
-                if (cc == ']') {
-                    // ]] -> ]
-                    if (i + 1 < s.length() && s.charAt(i + 1) == ']') {
-                        sb.append(']');
-                        i += 2;
-                        continue;
-                    }
-                    i++; // consume ending ]
-                    return new IdentifierToken(sb.toString(), i - start);
-                }
-                sb.append(cc);
-                i++;
-            }
-            return null;
-        }
-
-        int start = i;
-        while (i < s.length()) {
-            char cc = s.charAt(i);
-            if (Character.isLetterOrDigit(cc) || cc == '_' || cc == '$' || cc == '#') {
-                i++;
-                continue;
-            }
-            break;
-        }
-        if (i == start) {
-            return null;
-        }
-        return new IdentifierToken(s.substring(start, i), i - start);
-    }
-
-    /**
-     * 读取 PostgreSQL Dollar-Quoted 的分隔符（例如 $$ 或 $tag$）。
-     */
-    private static String tryReadDollarDelimiter(String s, int i) {
-        int next = s.indexOf('$', i + 1);
-        if (next < 0) {
-            return null;
-        }
-        // $tag$ 里 tag 只能是字母/数字/下划线
-        for (int k = i + 1; k < next; k++) {
-            char c = s.charAt(k);
-            if (!(Character.isLetterOrDigit(c) || c == '_')) {
-                return null;
-            }
-        }
-        return s.substring(i, next + 1);
-    }
-
-    private static int dollarDelimiterLength(String delimiter) {
-        return delimiter == null ? 0 : delimiter.length();
-    }
-
-    /**
-     * 解析到的标识符 token（包含“解析值”与“原始消耗长度”）。
-     */
-    private record IdentifierToken(String value, int rawLength) {
+        private static void reject(String message) { throw new IllegalArgumentException(message); }
     }
 }

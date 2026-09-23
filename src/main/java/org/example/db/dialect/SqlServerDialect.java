@@ -2,6 +2,7 @@ package org.example.db.dialect;
 
 import org.example.db.datasource.DatabaseType;
 import org.example.db.model.ColumnInfo;
+import org.example.db.util.JdbcValues;
 import org.example.db.model.TableInfo;
 import org.example.db.model.TableSchema;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -111,11 +112,10 @@ public class SqlServerDialect implements DatabaseDialect {
                 """;
 
         List<ColumnInfo> columns = jdbcTemplate.query(columnSql, (rs, rowNum) -> {
-            Integer rawMaxLen = (Integer) rs.getObject("character_maximum_length");
-            Integer normalizedMaxLen = normalizeMaxLength(rs.getString("data_type"), rawMaxLen);
+            Long rawMaxLen = JdbcValues.nullableLong(rs, "character_maximum_length");
+            Long normalizedMaxLen = normalizeMaxLength(rs.getString("data_type"), rawMaxLen);
 
-            Integer nullableInt = (Integer) rs.getObject("is_nullable");
-            boolean nullable = nullableInt != null && nullableInt != 0;
+            boolean nullable = rs.getBoolean("is_nullable");
 
             return new ColumnInfo(
                     rs.getInt("ordinal_position"),
@@ -123,8 +123,8 @@ public class SqlServerDialect implements DatabaseDialect {
                     rs.getString("data_type"),
                     rs.getString("udt_name"),
                     normalizedMaxLen,
-                    (Integer) rs.getObject("numeric_precision"),
-                    (Integer) rs.getObject("numeric_scale"),
+                    JdbcValues.nullableInt(rs, "numeric_precision"),
+                    JdbcValues.nullableInt(rs, "numeric_scale"),
                     nullable,
                     rs.getString("column_default"),
                     rs.getString("column_comment")
@@ -175,7 +175,7 @@ public class SqlServerDialect implements DatabaseDialect {
      * <p>
      * 另外：max_length = -1 表示 MAX（此处返回 null 代表不确定/不限制）。
      */
-    private Integer normalizeMaxLength(String dataType, Integer rawMaxLength) {
+    private Long normalizeMaxLength(String dataType, Long rawMaxLength) {
         if (rawMaxLength == null) {
             return null;
         }

@@ -28,6 +28,7 @@ public record SqlExecuteResult(
         boolean limited,
         Instant executedAt,
         List<String> warnings,
-        String message
+        String message,
+        List<QueryColumn> columns
 ) {
 }

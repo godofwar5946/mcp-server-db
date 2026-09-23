@@ -27,7 +27,7 @@ public class DatabaseClientRegistry {
 
     private final DbExplorerProperties properties;
     private final Map<String, DatabaseClient> clients;
-    private final Map<String, DatabaseType> resolvedTypes = new LinkedHashMap<>();
+    private final Map<String, DatabaseType> resolvedTypes = new java.util.concurrent.ConcurrentHashMap<>();
 
     public DatabaseClientRegistry(DbExplorerProperties properties) {
         this.properties = Objects.requireNonNull(properties, "properties must not be null");
@@ -81,32 +81,21 @@ public class DatabaseClientRegistry {
      *   <li>否则通过 JDBC 元数据自动识别并缓存</li>
      * </ul>
      */
-    public synchronized DatabaseType resolveDatabaseType(String dataSourceId) {
-        String resolvedId = resolveDataSourceId(dataSourceId);
-        DatabaseType cached = resolvedTypes.get(resolvedId);
-        if (cached != null) {
-            return cached;
-        }
-
-        DbExplorerProperties.DataSourceProperties cfg = properties.getDataSources().get(resolvedId);
-        if (cfg == null) {
-            throw new IllegalArgumentException("未知的数据源: " + resolvedId + "，已配置数据源=" + properties.getDataSources().keySet());
-        }
-
-        DatabaseType type = cfg.getType();
-        if (type == null || type == DatabaseType.UNKNOWN) {
-            DatabaseClient client = getClient(resolvedId);
-            type = DatabaseTypeDetector.detect(client.dataSource());
-        }
-        resolvedTypes.put(resolvedId, type);
-        return type;
+    public DatabaseType resolveDatabaseType(String dataSourceId) {
+        String id = resolveDataSourceId(dataSourceId);
+        return resolvedTypes.computeIfAbsent(id, key -> {
+            var cfg = getDataSourceConfig(key);
+            if (cfg.getType() != null && cfg.getType() != DatabaseType.UNKNOWN) return cfg.getType();
+            DatabaseType fromUrl = DatabaseTypeDetector.fromUrl(cfg.getUrl());
+            return fromUrl == DatabaseType.UNKNOWN ? DatabaseTypeDetector.detect(getClient(key).dataSource()) : fromUrl;
+        });
     }
 
     /**
-     * 供 Spring Boot / MyBatis 等框架使用的“主数据源”（默认数据源）。
+     * 供 Spring Boot 使用的主数据源（默认数据源）。
      * <p>
      * 说明：本项目的 MCP 逻辑走 Registry 自己选择数据源；这里提供主数据源主要是为了兼容
-     * 一些依赖 DataSource Bean 的自动装配（例如 mybatis-plus）。
+     * 依赖 DataSource Bean 的自动装配。
      */
     public DataSource getPrimaryDataSource() {
         return getClient(properties.getDefaultDataSource()).dataSource();
@@ -137,8 +126,9 @@ public class DatabaseClientRegistry {
             DbExplorerProperties.DataSourceProperties cfg = entry.getValue();
             DataSource ds = createDruidDataSource(cfg, properties.getPool());
             JdbcTemplate jdbcTemplate = new JdbcTemplate(ds);
-            // 统一通过 JDBC Statement#setMaxRows 控制最大返回行数（跨数据库通用）
-            jdbcTemplate.setMaxRows(properties.getQueryMaxRows() + 1);
+            // Metadata needs all columns; only the user SQL Statement receives a row limit.
+            jdbcTemplate.setQueryTimeout(properties.getQueryTimeoutSeconds());
+            jdbcTemplate.setFetchSize(properties.getQueryFetchSize());
             map.put(id, new DatabaseClient(id, ds, jdbcTemplate));
         }
         return map;
@@ -157,7 +147,15 @@ public class DatabaseClientRegistry {
         ds.setMinIdle(pool.getMinIdle());
         ds.setMaxActive(pool.getMaxActive());
         ds.setMaxWait(pool.getMaxWait().toMillis());
-        ds.setValidationQuery(pool.getValidationQuery());
+        ds.setConnectTimeout(Math.toIntExact(pool.getConnectTimeout().toMillis()));
+        ds.setSocketTimeout(Math.toIntExact(pool.getSocketTimeout().toMillis()));
+        DatabaseType type = cfg.getType() == null || cfg.getType() == DatabaseType.UNKNOWN
+                ? DatabaseTypeDetector.fromUrl(cfg.getUrl()) : cfg.getType();
+        String validation = cfg.getValidationQuery();
+        if (validation == null || validation.isBlank()) validation = pool.getValidationQuery();
+        if (validation == null || validation.isBlank()) validation = type == DatabaseType.ORACLE ? "SELECT 1 FROM DUAL" : "SELECT 1";
+        ds.setValidationQuery(validation);
+        ds.setValidationQueryTimeout(Math.min(5, properties.getQueryTimeoutSeconds()));
         ds.setTestWhileIdle(pool.isTestWhileIdle());
         ds.setTestOnBorrow(pool.isTestOnBorrow());
         ds.setTestOnReturn(pool.isTestOnReturn());

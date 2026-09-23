@@ -3,6 +3,7 @@
 # ==========================
 spring:
   main:
+    banner-mode: off
     # stdio 连接不需要 HTTP 服务，关闭 Web 容器，避免额外线程与日志干扰
     web-application-type: none
 

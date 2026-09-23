@@ -21,6 +21,7 @@ public record SqlQueryResult(
         boolean limited,
         int returnedRows,
         Instant executedAt,
-        List<String> warnings
+        List<String> warnings,
+        List<QueryColumn> columns
 ) {
 }

@@ -2,6 +2,7 @@ package org.example.db.dialect;
 
 import org.example.db.datasource.DatabaseType;
 import org.example.db.model.ColumnInfo;
+import org.example.db.util.JdbcValues;
 import org.example.db.model.TableInfo;
 import org.example.db.model.TableSchema;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -97,9 +98,9 @@ public class MysqlDialect implements DatabaseDialect {
                 rs.getString("column_name"),
                 rs.getString("data_type"),
                 rs.getString("column_type"),
-                (Integer) rs.getObject("character_maximum_length"),
-                (Integer) rs.getObject("numeric_precision"),
-                (Integer) rs.getObject("numeric_scale"),
+                JdbcValues.nullableLong(rs, "character_maximum_length"),
+                JdbcValues.nullableInt(rs, "numeric_precision"),
+                JdbcValues.nullableInt(rs, "numeric_scale"),
                 Objects.equals("YES", rs.getString("is_nullable")),
                 rs.getString("column_default"),
                 rs.getString("column_comment")

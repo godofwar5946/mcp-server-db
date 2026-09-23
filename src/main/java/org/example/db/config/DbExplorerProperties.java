@@ -1,412 +1,300 @@
 package org.example.db.config;
 
-import jakarta.validation.constraints.Max;
-import jakarta.validation.constraints.Min;
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.*;
 import org.example.db.datasource.DatabaseType;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
-
 import java.time.Duration;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-/**
- * MCP DB Server 的业务配置项。
- * <p>
- * 设计目标：
- * <ul>
- *   <li>支持多数据源（可同时配置 PostgreSQL/MySQL/Oracle/SQLServer 等）</li>
- *   <li>每个数据源都有自己的 defaultSchema / allowedSchemas（白名单控制，避免越权访问）</li>
- *   <li>表结构缓存（TTL）减少频繁访问系统表</li>
- *   <li>写入 SQL 采用“两段式确认”（prepare -> confirm）降低误操作风险</li>
- * </ul>
- */
 @Validated
 @ConfigurationProperties(prefix = "app.db")
 public class DbExplorerProperties {
-
-    /**
-     * 默认使用的数据源 ID（当 MCP 工具入参未指定 dataSourceId 时使用）。
-     */
     @NotBlank
     private String defaultDataSource = "primary";
 
-    /**
-     * 多数据源配置。
-     * <p>
-     * key 为 dataSourceId（例如：primary、pg1、mysql1、oracle1、mssql1），value 为连接信息与 schema 白名单等。
-     */
-    @NotNull
+    @NotEmpty @Valid
     private Map<String, DataSourceProperties> dataSources = new LinkedHashMap<>();
 
-    /**
-     * 表结构缓存 TTL（减少频繁查询系统表）。
-     */
     @NotNull
-    private Duration schemaCacheTtl = Duration.ofMinutes(10);
+    private Duration schemaCacheTtl = Duration.ofMinutes(20);
 
-    /**
-     * 表结构缓存最大条数（避免极端情况下内存持续增长）。
-     */
-    @Min(10)
-    @Max(10_000)
-    private int schemaCacheMaxSize = 500;
+    @Min(10) @Max(10000)
+    private int schemaCacheMaxSize = 5000;
 
-    /**
-     * 表/视图列表最大返回条数（用于 db_list_tables 的分页上限保护）。
-     * <p>
-     * 当一个 schema 下有几千张表时，强烈建议：
-     * <ul>
-     *   <li>通过 keyword 过滤（模糊匹配表名）</li>
-     *   <li>通过 limit/offset 分页拉取</li>
-     * </ul>
-     */
-    @Min(1)
-    @Max(10_000)
+    @Min(1) @Max(10000)
     private int tableListMaxRows = 200;
 
-    /**
-     * 批量获取表结构时的并发度（线程池大小）。
-     * <p>
-     * 建议：
-     * <ul>
-     *   <li>不要超过连接池最大连接数（app.db.pool.max-active）</li>
-     *   <li>大多数场景 4~8 足够</li>
-     * </ul>
-     */
-    @Min(1)
-    @Max(64)
+    @Min(1) @Max(64)
     private int schemaFetchParallelism = 4;
 
-    /**
-     * 单次批量获取表结构允许的最大表数量（防止一次请求过大）。
-     */
-    @Min(1)
-    @Max(1000)
+    @Min(1) @Max(10000)
+    private int schemaQueueCapacity = 200;
+
+    @Min(1) @Max(1000)
     private int schemaBatchMaxTables = 50;
 
-    /**
-     * 查询最大返回行数（工具侧保护，避免一次拉取过多数据导致内存/网络压力）。
-     */
-    @Min(1)
-    @Max(100_000)
+    @NotNull
+    private Duration schemaBatchTimeout = Duration.ofSeconds(35);
+
+    @Min(1) @Max(100000)
     private int queryMaxRows = 500;
 
-    /**
-     * 待确认 SQL 的有效期；超时 token 失效，需要重新 prepare。
-     */
+    @Min(1) @Max(3600)
+    private int queryTimeoutSeconds = 30;
+
+    @Min(1) @Max(10000)
+    private int queryFetchSize = 100;
+
+    @Min(1024) @Max(1048576)
+    private int sqlMaxLength = 65536;
+
+    @Min(1024) @Max(16777216)
+    private int resultMaxBytes = 1048576;
+
+    @Min(64) @Max(1048576)
+    private int fieldMaxLength = 16384;
+
     @NotNull
     private Duration pendingSqlTtl = Duration.ofMinutes(10);
 
-    /**
-     * 是否允许执行 DDL（例如：CREATE/ALTER/DROP/TRUNCATE）。
-     * <p>
-     * 默认关闭：避免模型误生成 DDL 破坏结构。
-     */
+    @Min(1) @Max(10000)
+    private int pendingSqlMaxSize = 1000;
+
+
     private boolean allowDdl = false;
 
-    /**
-     * 连接池配置（当前项目使用 Druid）。
-     * <p>
-     * 说明：为了简化管理，这里提供“全局默认池配置”，各数据源共用；
-     * 如果你需要“每个数据源独立的池参数”，可以再加一层覆盖配置。
-     */
-    @NotNull
+
+    private boolean allowFullTableWrite = false;
+
+
+    private boolean auditIncludeSql = false;
+
+    @NotNull @Valid
     private PoolProperties pool = new PoolProperties();
 
-    public String getDefaultDataSource() {
-        return defaultDataSource;
-    }
+    @NotEmpty
+    private Set<String> allowedFunctions = new HashSet<>(List.of("count", "sum", "avg", "min", "max", "coalesce", "nullif",
+            "lower", "upper", "length", "char_length", "abs", "round", "ceil", "ceiling", "floor",
+            "substring", "substr", "trim", "ltrim", "rtrim", "concat", "replace", "cast", "convert",
+            "date_trunc", "date_part", "extract", "to_char", "to_date", "to_timestamp", "now",
+            "current_date", "current_timestamp", "getdate", "isnull", "ifnull", "nvl",
+            "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value",
+            "string_agg", "group_concat", "listagg", "array_agg", "json_agg", "jsonb_agg",
+            "greatest", "least", "mod", "power", "sqrt", "dateadd", "datediff", "date_format",
+            // Text length, slicing and searching across the supported databases.
+            "left", "right", "mid", "substring_index", "split_part", "len", "datalength",
+            "character_length", "octet_length", "bit_length", "lengthb", "lengthc", "length2", "length4",
+            "substrb", "substrc", "substr2", "substr4", "position", "strpos", "charindex", "patindex",
+            "instr", "instrb", "instrc", "instr2", "instr4", "locate", "starts_with",
+            // Text cleanup, regular expressions and character construction.
+            "btrim", "initcap", "concat_ws", "translate", "reverse", "stuff", "overlay",
+            "lpad", "rpad", "repeat", "replicate", "space", "chr", "char", "nchar", "ascii", "unicode",
+            "regexp_like", "regexp_count", "regexp_instr", "regexp_substr", "regexp_replace",
+            "regexp_match", "regexp_split_to_array", "string_to_array", "array_to_string", "string_escape",
+            // Read-only text table functions and Oracle LOB accessors.
+            "string_to_table", "regexp_split_to_table", "string_split",
+            "dbms_lob.substr", "dbms_lob.getlength", "dbms_lob.instr",
+            // PostgreSQL JSONPath inspection and extraction, including timezone-aware variants.
+            "jsonb_path_exists", "jsonb_path_match", "jsonb_path_query", "jsonb_path_query_array", "jsonb_path_query_first",
+            "jsonb_path_exists_tz", "jsonb_path_match_tz", "jsonb_path_query_tz",
+            "jsonb_path_query_array_tz", "jsonb_path_query_first_tz"));
 
-    public void setDefaultDataSource(String defaultDataSource) {
-        this.defaultDataSource = defaultDataSource;
-    }
+    public String getDefaultDataSource() { return defaultDataSource; }
+    public void setDefaultDataSource(String value) { this.defaultDataSource = value; }
 
-    public Map<String, DataSourceProperties> getDataSources() {
-        return dataSources;
-    }
+    public Map<String, DataSourceProperties> getDataSources() { return dataSources; }
+    public void setDataSources(Map<String, DataSourceProperties> value) { this.dataSources = value; }
 
-    public void setDataSources(Map<String, DataSourceProperties> dataSources) {
-        this.dataSources = dataSources;
-    }
+    public Duration getSchemaCacheTtl() { return schemaCacheTtl; }
+    public void setSchemaCacheTtl(Duration value) { this.schemaCacheTtl = value; }
 
-    public Duration getSchemaCacheTtl() {
-        return schemaCacheTtl;
-    }
+    public int getSchemaCacheMaxSize() { return schemaCacheMaxSize; }
+    public void setSchemaCacheMaxSize(int value) { this.schemaCacheMaxSize = value; }
 
-    public void setSchemaCacheTtl(Duration schemaCacheTtl) {
-        this.schemaCacheTtl = schemaCacheTtl;
-    }
+    public int getTableListMaxRows() { return tableListMaxRows; }
+    public void setTableListMaxRows(int value) { this.tableListMaxRows = value; }
 
-    public int getSchemaCacheMaxSize() {
-        return schemaCacheMaxSize;
-    }
+    public int getSchemaFetchParallelism() { return schemaFetchParallelism; }
+    public void setSchemaFetchParallelism(int value) { this.schemaFetchParallelism = value; }
 
-    public void setSchemaCacheMaxSize(int schemaCacheMaxSize) {
-        this.schemaCacheMaxSize = schemaCacheMaxSize;
-    }
+    public int getSchemaQueueCapacity() { return schemaQueueCapacity; }
+    public void setSchemaQueueCapacity(int value) { this.schemaQueueCapacity = value; }
 
-    public int getTableListMaxRows() {
-        return tableListMaxRows;
-    }
+    public int getSchemaBatchMaxTables() { return schemaBatchMaxTables; }
+    public void setSchemaBatchMaxTables(int value) { this.schemaBatchMaxTables = value; }
 
-    public void setTableListMaxRows(int tableListMaxRows) {
-        this.tableListMaxRows = tableListMaxRows;
-    }
+    public Duration getSchemaBatchTimeout() { return schemaBatchTimeout; }
+    public void setSchemaBatchTimeout(Duration value) { this.schemaBatchTimeout = value; }
 
-    public int getSchemaFetchParallelism() {
-        return schemaFetchParallelism;
-    }
+    public int getQueryMaxRows() { return queryMaxRows; }
+    public void setQueryMaxRows(int value) { this.queryMaxRows = value; }
 
-    public void setSchemaFetchParallelism(int schemaFetchParallelism) {
-        this.schemaFetchParallelism = schemaFetchParallelism;
-    }
+    public int getQueryTimeoutSeconds() { return queryTimeoutSeconds; }
+    public void setQueryTimeoutSeconds(int value) { this.queryTimeoutSeconds = value; }
 
-    public int getSchemaBatchMaxTables() {
-        return schemaBatchMaxTables;
-    }
+    public int getQueryFetchSize() { return queryFetchSize; }
+    public void setQueryFetchSize(int value) { this.queryFetchSize = value; }
 
-    public void setSchemaBatchMaxTables(int schemaBatchMaxTables) {
-        this.schemaBatchMaxTables = schemaBatchMaxTables;
-    }
+    public int getSqlMaxLength() { return sqlMaxLength; }
+    public void setSqlMaxLength(int value) { this.sqlMaxLength = value; }
 
-    public int getQueryMaxRows() {
-        return queryMaxRows;
-    }
+    public int getResultMaxBytes() { return resultMaxBytes; }
+    public void setResultMaxBytes(int value) { this.resultMaxBytes = value; }
 
-    public void setQueryMaxRows(int queryMaxRows) {
-        this.queryMaxRows = queryMaxRows;
-    }
+    public int getFieldMaxLength() { return fieldMaxLength; }
+    public void setFieldMaxLength(int value) { this.fieldMaxLength = value; }
 
-    public Duration getPendingSqlTtl() {
-        return pendingSqlTtl;
-    }
+    public Duration getPendingSqlTtl() { return pendingSqlTtl; }
+    public void setPendingSqlTtl(Duration value) { this.pendingSqlTtl = value; }
 
-    public void setPendingSqlTtl(Duration pendingSqlTtl) {
-        this.pendingSqlTtl = pendingSqlTtl;
-    }
+    public int getPendingSqlMaxSize() { return pendingSqlMaxSize; }
+    public void setPendingSqlMaxSize(int value) { this.pendingSqlMaxSize = value; }
 
-    public boolean isAllowDdl() {
-        return allowDdl;
-    }
+    public boolean isAllowDdl() { return allowDdl; }
+    public void setAllowDdl(boolean value) { this.allowDdl = value; }
 
-    public void setAllowDdl(boolean allowDdl) {
-        this.allowDdl = allowDdl;
-    }
+    public boolean isAllowFullTableWrite() { return allowFullTableWrite; }
+    public void setAllowFullTableWrite(boolean value) { this.allowFullTableWrite = value; }
 
-    public PoolProperties getPool() {
-        return pool;
-    }
+    public boolean isAuditIncludeSql() { return auditIncludeSql; }
+    public void setAuditIncludeSql(boolean value) { this.auditIncludeSql = value; }
 
-    public void setPool(PoolProperties pool) {
-        this.pool = pool;
-    }
+    public PoolProperties getPool() { return pool; }
+    public void setPool(PoolProperties value) { this.pool = value; }
 
-    /**
-     * 单个数据源配置项。
-     */
+    public Set<String> getAllowedFunctions() { return allowedFunctions; }
+    public void setAllowedFunctions(Set<String> value) { this.allowedFunctions = value; }
+
+    @AssertTrue(message = "缓存和批量请求 TTL / 超时必须大于零")
+    public boolean isDurationsValid() {
+        return positive(schemaCacheTtl) && positive(pendingSqlTtl) && positive(schemaBatchTimeout);
+    }
+    private static boolean positive(Duration value) { return value != null && !value.isZero() && !value.isNegative(); }
+
     public static class DataSourceProperties {
 
-        /**
-         * 数据库类型（可选）。
-         * <p>
-         * - 不填：运行时通过 JDBC 元数据自动识别（推荐）。
-         * - 填了：按填写值强制使用（适合某些驱动 productName 不稳定的情况）。
-         */
-        private DatabaseType type;
+    private DatabaseType type;
 
-        /**
-         * JDBC URL（必填）。
-         */
-        @NotBlank
-        private String url;
+    @NotBlank
+    private String url;
 
-        /**
-         * 用户名（可选，部分数据库允许通过 URL 携带）。
-         */
-        private String username;
 
-        /**
-         * 密码（可选，建议仅用于本地测试；生产建议走环境变量/密钥管理）。
-         */
-        private String password;
+    private String username;
 
-        /**
-         * JDBC Driver（可选，不填通常也能靠 SPI 自动加载；但某些场景建议显式指定）。
-         */
-        private String driverClassName;
 
-        /**
-         * 默认 schema（当工具入参 schema 为空时使用）。
-         * <p>
-         * - PostgreSQL/SQLServer：常见为 public / dbo
-         * - MySQL：这里对应“database”（即 information_schema.columns.table_schema）
-         * - Oracle：这里对应“owner/schema”（通常为用户名，建议大写）
-         */
-        @NotBlank
-        private String defaultSchema = "public";
+    private String password;
 
-        /**
-         * 允许访问的 schema 白名单：
-         * <ul>
-         *   <li>null/空：表示仅允许 defaultSchema</li>
-         *   <li>非空：必须在白名单中才能访问</li>
-         * </ul>
-         */
-        private List<String> allowedSchemas;
 
-        public DatabaseType getType() {
-            return type;
-        }
+    private String driverClassName;
 
-        public void setType(DatabaseType type) {
-            this.type = type;
-        }
+    @NotBlank
+    private String defaultSchema = "public";
 
-        public String getUrl() {
-            return url;
-        }
 
-        public void setUrl(String url) {
-            this.url = url;
-        }
+    private List<String> allowedSchemas;
 
-        public String getUsername() {
-            return username;
-        }
 
-        public void setUsername(String username) {
-            this.username = username;
-        }
+    private boolean allowWrites = false;
 
-        public String getPassword() {
-            return password;
-        }
 
-        public void setPassword(String password) {
-            this.password = password;
-        }
+    private String validationQuery;
 
-        public String getDriverClassName() {
-            return driverClassName;
-        }
+    public DatabaseType getType() { return type; }
+    public void setType(DatabaseType value) { this.type = value; }
 
-        public void setDriverClassName(String driverClassName) {
-            this.driverClassName = driverClassName;
-        }
+    public String getUrl() { return url; }
+    public void setUrl(String value) { this.url = value; }
 
-        public String getDefaultSchema() {
-            return defaultSchema;
-        }
+    public String getUsername() { return username; }
+    public void setUsername(String value) { this.username = value; }
 
-        public void setDefaultSchema(String defaultSchema) {
-            this.defaultSchema = defaultSchema;
-        }
+    public String getPassword() { return password; }
+    public void setPassword(String value) { this.password = value; }
 
-        public List<String> getAllowedSchemas() {
-            return allowedSchemas;
-        }
+    public String getDriverClassName() { return driverClassName; }
+    public void setDriverClassName(String value) { this.driverClassName = value; }
 
-        public void setAllowedSchemas(List<String> allowedSchemas) {
-            this.allowedSchemas = allowedSchemas;
-        }
+    public String getDefaultSchema() { return defaultSchema; }
+    public void setDefaultSchema(String value) { this.defaultSchema = value; }
+
+    public List<String> getAllowedSchemas() { return allowedSchemas; }
+    public void setAllowedSchemas(List<String> value) { this.allowedSchemas = value; }
+
+    public boolean isAllowWrites() { return allowWrites; }
+    public void setAllowWrites(boolean value) { this.allowWrites = value; }
+
+    public String getValidationQuery() { return validationQuery; }
+    public void setValidationQuery(String value) { this.validationQuery = value; }
+
     }
-
-    /**
-     * Druid 连接池参数（全局默认）。
-     */
     public static class PoolProperties {
+    @Min(0)
+    private int initialSize = 0;
 
-        @Min(0)
-        private int initialSize = 5;
+    @Min(0)
+    private int minIdle = 0;
 
-        @Min(0)
-        private int minIdle = 5;
+    @Min(1) @Max(200)
+    private int maxActive = 20;
 
-        @Min(1)
-        private int maxActive = 20;
+    @NotNull
+    private Duration maxWait = Duration.ofSeconds(10);
 
-        /**
-         * 最大等待时间。
-         */
-        @NotNull
-        private Duration maxWait = Duration.ofSeconds(60);
+    @NotNull
+    private Duration connectTimeout = Duration.ofSeconds(10);
 
-        /**
-         * 连接校验 SQL：不同库通用用法是 SELECT 1。
-         */
-        @NotBlank
-        private String validationQuery = "SELECT 1";
+    @NotNull
+    private Duration socketTimeout = Duration.ofSeconds(35);
 
-        private boolean testWhileIdle = true;
-        private boolean testOnBorrow = false;
-        private boolean testOnReturn = false;
 
-        public int getInitialSize() {
-            return initialSize;
-        }
+    private String validationQuery;
 
-        public void setInitialSize(int initialSize) {
-            this.initialSize = initialSize;
-        }
 
-        public int getMinIdle() {
-            return minIdle;
-        }
+    private boolean testWhileIdle = true;
 
-        public void setMinIdle(int minIdle) {
-            this.minIdle = minIdle;
-        }
 
-        public int getMaxActive() {
-            return maxActive;
-        }
+    private boolean testOnBorrow = false;
 
-        public void setMaxActive(int maxActive) {
-            this.maxActive = maxActive;
-        }
 
-        public Duration getMaxWait() {
-            return maxWait;
-        }
+    private boolean testOnReturn = false;
 
-        public void setMaxWait(Duration maxWait) {
-            this.maxWait = maxWait;
-        }
+    public int getInitialSize() { return initialSize; }
+    public void setInitialSize(int value) { this.initialSize = value; }
 
-        public String getValidationQuery() {
-            return validationQuery;
-        }
+    public int getMinIdle() { return minIdle; }
+    public void setMinIdle(int value) { this.minIdle = value; }
 
-        public void setValidationQuery(String validationQuery) {
-            this.validationQuery = validationQuery;
-        }
+    public int getMaxActive() { return maxActive; }
+    public void setMaxActive(int value) { this.maxActive = value; }
 
-        public boolean isTestWhileIdle() {
-            return testWhileIdle;
-        }
+    public Duration getMaxWait() { return maxWait; }
+    public void setMaxWait(Duration value) { this.maxWait = value; }
 
-        public void setTestWhileIdle(boolean testWhileIdle) {
-            this.testWhileIdle = testWhileIdle;
-        }
+    public Duration getConnectTimeout() { return connectTimeout; }
+    public void setConnectTimeout(Duration value) { this.connectTimeout = value; }
 
-        public boolean isTestOnBorrow() {
-            return testOnBorrow;
-        }
+    public Duration getSocketTimeout() { return socketTimeout; }
+    public void setSocketTimeout(Duration value) { this.socketTimeout = value; }
 
-        public void setTestOnBorrow(boolean testOnBorrow) {
-            this.testOnBorrow = testOnBorrow;
-        }
+    public String getValidationQuery() { return validationQuery; }
+    public void setValidationQuery(String value) { this.validationQuery = value; }
 
-        public boolean isTestOnReturn() {
-            return testOnReturn;
-        }
+    public boolean isTestWhileIdle() { return testWhileIdle; }
+    public void setTestWhileIdle(boolean value) { this.testWhileIdle = value; }
 
-        public void setTestOnReturn(boolean testOnReturn) {
-            this.testOnReturn = testOnReturn;
+    public boolean isTestOnBorrow() { return testOnBorrow; }
+    public void setTestOnBorrow(boolean value) { this.testOnBorrow = value; }
+
+    public boolean isTestOnReturn() { return testOnReturn; }
+    public void setTestOnReturn(boolean value) { this.testOnReturn = value; }
+
+        @AssertTrue(message = "连接池大小、连接等待时间和网络超时无效")
+        public boolean isPoolValid() {
+            return initialSize <= maxActive && minIdle <= maxActive
+                    && positive(maxWait) && positive(connectTimeout) && positive(socketTimeout)
+                    && connectTimeout.toMillis() <= Integer.MAX_VALUE && socketTimeout.toMillis() <= Integer.MAX_VALUE;
         }
     }
 }

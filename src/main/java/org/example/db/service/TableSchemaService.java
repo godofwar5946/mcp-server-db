@@ -16,11 +16,11 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * 表结构服务：统一处理 schema 白名单校验 + 表结构缓存 + 多数据源/多方言路由。
@@ -33,13 +33,16 @@ public class TableSchemaService {
     private final DatabaseDialectRegistry dialectRegistry;
     private final TableSchemaCache cache;
     private final ExecutorService schemaFetchExecutor;
+    private final TableMetadataReader metadata;
 
     public TableSchemaService(
             DbExplorerProperties properties,
             DatabaseClientRegistry clientRegistry,
             DatabaseDialectRegistry dialectRegistry,
-            @Qualifier("schemaFetchExecutor") ExecutorService schemaFetchExecutor
+            @Qualifier("schemaFetchExecutor") ExecutorService schemaFetchExecutor,
+            TableMetadataReader metadata
     ) {
+        this.metadata = metadata;
         this.properties = properties;
         this.clientRegistry = clientRegistry;
         this.dialectRegistry = dialectRegistry;
@@ -102,7 +105,7 @@ public class TableSchemaService {
         DatabaseClient client = clientRegistry.getClient(resolvedDataSourceId);
         DatabaseDialect dialect = resolveDialect(resolvedDataSourceId);
         return cache.getOrLoad(resolvedDataSourceId, resolvedSchema, safeTable, refresh,
-                () -> dialect.getTableSchema(client.jdbcTemplate(), resolvedSchema, safeTable));
+                () -> metadata.enrich(client, dialect.getTableSchema(client.jdbcTemplate(), resolvedSchema, safeTable)));
     }
 
     /**
@@ -119,9 +122,13 @@ public class TableSchemaService {
             throw new IllegalArgumentException("tables 不能为空");
         }
 
+        if (tables.size() > properties.getSchemaBatchMaxTables()) {
+            throw new IllegalArgumentException("tables 数量超过单次上限");
+        }
         // 去重 + 去空白
         List<String> requestedTables = tables.stream()
                 .filter(t -> t != null && !t.isBlank())
+                .map(String::trim)
                 .distinct()
                 .toList();
 
@@ -136,8 +143,17 @@ public class TableSchemaService {
         DatabaseDialect dialect = resolveDialect(resolvedDataSourceId);
 
         List<CompletableFuture<TableSchemaBatchItem>> futures = new ArrayList<>(requestedTables.size());
+        long timeoutMs = properties.getSchemaBatchTimeout().toMillis();
+        long deadline = System.nanoTime() + properties.getSchemaBatchTimeout().toNanos();
         for (String table : requestedTables) {
-            futures.add(CompletableFuture.supplyAsync(() -> loadSingleTableSchema(resolvedDataSourceId, resolvedSchema, table, resolvedRefresh, client, dialect), schemaFetchExecutor));
+            try {
+                futures.add(CompletableFuture.supplyAsync(() -> {
+                    if (System.nanoTime() >= deadline) return new TableSchemaBatchItem(table, false, null, "请求超时");
+                    return loadSingleTableSchema(resolvedDataSourceId, resolvedSchema, table, resolvedRefresh, client, dialect);
+                }, schemaFetchExecutor).completeOnTimeout(new TableSchemaBatchItem(table, false, null, "请求超时"), timeoutMs, TimeUnit.MILLISECONDS));
+            } catch (RejectedExecutionException e) {
+                futures.add(CompletableFuture.completedFuture(new TableSchemaBatchItem(table, false, null, "请求队列已满，请稍后重试")));
+            }
         }
 
         List<TableSchemaBatchItem> items = futures.stream().map(CompletableFuture::join).toList();
@@ -162,6 +178,8 @@ public class TableSchemaService {
         String safeTable = IdentifierUtils.requireSafeIdentifier(table, "table");
         cache.invalidate(resolvedDataSourceId, resolvedSchema, safeTable);
     }
+
+    public void invalidateDataSource(String dataSourceId) { cache.invalidateDataSource(dataSourceId); }
 
     private DatabaseDialect resolveDialect(String dataSourceId) {
         DatabaseType type = clientRegistry.resolveDatabaseType(dataSourceId);
@@ -195,15 +213,15 @@ public class TableSchemaService {
         try {
             safeTable = IdentifierUtils.requireSafeIdentifier(table, "table");
         } catch (Exception e) {
-            return new TableSchemaBatchItem(table, false, null, e.getMessage());
+            return new TableSchemaBatchItem(table, false, null, "无法读取表结构，请检查对象名、连接或权限");
         }
 
         try {
             TableSchema tableSchema = cache.getOrLoad(dataSourceId, schema, safeTable, refresh,
-                    () -> dialect.getTableSchema(client.jdbcTemplate(), schema, safeTable));
+                    () -> metadata.enrich(client, dialect.getTableSchema(client.jdbcTemplate(), schema, safeTable)));
             return new TableSchemaBatchItem(table, true, tableSchema, null);
         } catch (Exception e) {
-            return new TableSchemaBatchItem(table, false, null, e.getMessage());
+            return new TableSchemaBatchItem(table, false, null, "无法读取表结构，请检查对象名、连接或权限");
         }
     }
 
@@ -217,23 +235,8 @@ public class TableSchemaService {
         String resolved = (schema == null || schema.isBlank()) ? cfg.getDefaultSchema() : schema;
         String safeSchema = IdentifierUtils.requireSafeIdentifier(resolved, "schema");
 
-        List<String> allowed = cfg.getAllowedSchemas();
-        if (allowed == null || allowed.isEmpty()) {
-            if (!safeSchema.equalsIgnoreCase(cfg.getDefaultSchema())) {
-                throw new IllegalArgumentException("不允许访问 schema: " + safeSchema + "（仅允许 defaultSchema=" + cfg.getDefaultSchema() + "）");
-            }
-            return safeSchema;
-        }
-
-        // 支持 "*" 表示放开所有 schema（不推荐生产环境）
-        Set<String> allowedSet = new HashSet<>(allowed);
-        if (allowedSet.contains("*")) {
-            return safeSchema;
-        }
-
-        boolean ok = allowed.stream().anyMatch(s -> s != null && s.equalsIgnoreCase(safeSchema));
-        if (!ok) {
-            throw new IllegalArgumentException("不允许访问 schema: " + safeSchema + "（允许列表=" + allowed + "）");
+        if (!org.example.db.sql.SqlUtils.schemaAllowed(safeSchema, cfg.getDefaultSchema(), cfg.getAllowedSchemas())) {
+            throw new SecurityException("不允许访问 schema: " + safeSchema);
         }
         return safeSchema;
     }

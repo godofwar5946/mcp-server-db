@@ -1,32 +1,29 @@
 package org.example.mcp.keepalive;
 
 import io.modelcontextprotocol.server.transport.WebMvcStreamableServerTransportProvider;
-import org.springframework.beans.BeansException;
-import org.springframework.beans.factory.config.BeanPostProcessor;
+import org.springframework.ai.mcp.server.common.autoconfigure.properties.McpServerStreamableHttpProperties;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.context.event.EventListener;
 
-/**
- * MCP keep-alive 优化装配：
- * <ul>
- *   <li>监听 {@link WebMvcStreamableServerTransportProvider} Bean 初始化完成</li>
- *   <li>将其绑定到 {@link McpKeepAliveCleaner}，实现断连会话自动清理</li>
- * </ul>
- */
-@Configuration
+@Configuration(proxyBeanMethods = false)
+@ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+@ConditionalOnProperty(name = "spring.ai.mcp.server.stdio", havingValue = "false", matchIfMissing = true)
 public class McpKeepAliveConfiguration {
-
     @Bean
-    public BeanPostProcessor mcpKeepAliveCleanerPostProcessor(McpKeepAliveCleaner cleaner) {
-        return new BeanPostProcessor() {
-            @Override
-            public Object postProcessAfterInitialization(Object bean, String beanName) throws BeansException {
-                if (bean instanceof WebMvcStreamableServerTransportProvider provider) {
-                    cleaner.attach(provider);
-                }
-                return bean;
-            }
-        };
+    McpKeepAliveCleaner mcpKeepAliveCleaner(McpServerStreamableHttpProperties http,
+                                          McpKeepAliveCleanupProperties cleanup) {
+        return new McpKeepAliveCleaner(http, cleanup);
+    }
+    @Bean
+    Attachment keepAliveAttachment(McpKeepAliveCleaner cleaner, WebMvcStreamableServerTransportProvider provider) {
+        return new Attachment(cleaner, provider);
+    }
+    public record Attachment(McpKeepAliveCleaner cleaner, WebMvcStreamableServerTransportProvider provider) {
+        @EventListener(ContextRefreshedEvent.class)
+        public void attach() { cleaner.attach(provider); }
     }
 }
-

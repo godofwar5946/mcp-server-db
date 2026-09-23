@@ -9,23 +9,16 @@ import java.util.Objects;
 import java.util.function.Supplier;
 
 /**
- * 表结构缓存（本地内存版，LRU + TTL）。
- * <p>
- * 为什么要用 LRU：
- * <ul>
- *   <li>schema 下可能有几千张表，如果超过阈值直接“清空全量缓存”，会造成缓存抖动与性能下降</li>
- *   <li>LRU 会优先淘汰不常用的表结构，更符合真实访问模式</li>
- * </ul>
- * <p>
- * 说明：
- * <ul>
- *   <li>当前实现为单实例内存缓存；多实例部署可替换为 Redis/分布式缓存</li>
- *   <li>缓存 key 包含 dataSourceId/schema/table，支持多数据源隔离</li>
- * </ul>
+ * Bounded Caffeine cache with TTL and per-datasource generations.
+ * Generation changes keep old in-flight loads from repopulating caches after DDL.
  */
 public class TableSchemaCache {
 
     private final Cache<CacheKey, TableSchema> cache;
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong> generations = new java.util.concurrent.ConcurrentHashMap<>();
+    private long generation(String id) {
+        return generations.computeIfAbsent(id, k -> new java.util.concurrent.atomic.AtomicLong()).get();
+    }
 
     public TableSchemaCache(Duration ttl, int maxSize) {
         Objects.requireNonNull(ttl, "ttl must not be null");
@@ -40,7 +33,7 @@ public class TableSchemaCache {
 
     public TableSchema getOrLoad(String dataSourceId, String schema, String table, boolean refresh, Supplier<TableSchema> loader) {
         Objects.requireNonNull(loader, "loader must not be null");
-        CacheKey key = new CacheKey(dataSourceId, schema, table);
+        CacheKey key = new CacheKey(dataSourceId, schema, table, generation(dataSourceId));
         if (refresh) {
             cache.invalidate(key);
         }
@@ -48,14 +41,19 @@ public class TableSchemaCache {
     }
 
     public void invalidate(String dataSourceId, String schema, String table) {
-        cache.invalidate(new CacheKey(dataSourceId, schema, table));
+        cache.invalidate(new CacheKey(dataSourceId, schema, table, generation(dataSourceId)));
+    }
+
+    public void invalidateDataSource(String id) {
+        generations.computeIfAbsent(id, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
+        cache.asMap().keySet().removeIf(key -> key.dataSourceId().equals(id));
     }
 
     public void clear() {
         cache.invalidateAll();
     }
 
-    private record CacheKey(String dataSourceId, String schema, String table) {
+    private record CacheKey(String dataSourceId, String schema, String table, long generation) {
     }
 }
 

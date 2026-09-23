@@ -13,6 +13,16 @@ public final class DatabaseTypeDetector {
     private DatabaseTypeDetector() {
     }
 
+    public static DatabaseType fromUrl(String url) {
+        if (url == null) return DatabaseType.UNKNOWN;
+        String value = url.toLowerCase(Locale.ROOT);
+        if (value.startsWith("jdbc:postgresql:")) return DatabaseType.POSTGRESQL;
+        if (value.startsWith("jdbc:mysql:") || value.startsWith("jdbc:mariadb:")) return DatabaseType.MYSQL;
+        if (value.startsWith("jdbc:oracle:")) return DatabaseType.ORACLE;
+        if (value.startsWith("jdbc:sqlserver:")) return DatabaseType.SQLSERVER;
+        return DatabaseType.UNKNOWN;
+    }
+
     public static DatabaseType detect(DataSource dataSource) {
         try (Connection connection = dataSource.getConnection()) {
             DatabaseMetaData metaData = connection.getMetaData();

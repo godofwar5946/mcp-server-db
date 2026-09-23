@@ -16,7 +16,8 @@ public record DataSourceInfo(
         String url,
         String username,
         String defaultSchema,
-        List<String> allowedSchemas
+        List<String> allowedSchemas,
+        boolean allowWrites
 ) {
 }
 

@@ -2,6 +2,7 @@ package org.example.db.dialect;
 
 import org.example.db.datasource.DatabaseType;
 import org.example.db.model.ColumnInfo;
+import org.example.db.util.JdbcValues;
 import org.example.db.model.TableInfo;
 import org.example.db.model.TableSchema;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -20,7 +21,7 @@ import java.util.Locale;
  *   <li>字段类型/默认值/是否可空：ALL_TAB_COLUMNS</li>
  * </ul>
  * <p>
- * 注意：Oracle 的数据字典通常使用大写对象名（未加引号创建的对象），因此这里会把 schema/table 统一转大写。
+ * 注意：Oracle 的数据字典通常使用大写对象名（未加引号创建的对象），元数据工具使用实际对象名（普通对象通常应传大写）。
  */
 @Component
 public class OracleDialect implements DatabaseDialect {
@@ -108,9 +109,9 @@ public class OracleDialect implements DatabaseDialect {
                 rs.getString("column_name"),
                 rs.getString("data_type"),
                 rs.getString("udt_name"),
-                (Integer) rs.getObject("character_maximum_length"),
-                (Integer) rs.getObject("numeric_precision"),
-                (Integer) rs.getObject("numeric_scale"),
+                JdbcValues.nullableLong(rs, "character_maximum_length"),
+                JdbcValues.nullableInt(rs, "numeric_precision"),
+                JdbcValues.nullableInt(rs, "numeric_scale"),
                 "Y".equalsIgnoreCase(rs.getString("is_nullable")),
                 rs.getString("column_default"),
                 rs.getString("column_comment")
@@ -143,14 +144,14 @@ public class OracleDialect implements DatabaseDialect {
         if (schema == null) {
             return null;
         }
-        return schema.toUpperCase(Locale.ROOT);
+        return schema;
     }
 
     private String normalizeObjectName(String objectName) {
         if (objectName == null) {
             return null;
         }
-        return objectName.toUpperCase(Locale.ROOT);
+        return objectName;
     }
 
     private String normalizeType(String tableType) {

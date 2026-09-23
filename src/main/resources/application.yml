@@ -1,186 +1,97 @@
 server:
-  port: 8080
+  port: ${MCP_PORT:8080}
 
 spring:
   application:
-    name: mcp-server
-
-  # ==========================
-  # Redis（当前未使用：先禁用自动装配与检测）
-  # ==========================
-  # 说明：
-  # - pom.xml 中虽然引入了 spring-boot-starter-data-redis，但当前项目并不依赖 Redis
-  # - 在某些环境下（例如 K8S 探针/监控频繁访问 /actuator/health），Redis HealthIndicator 可能触发连接检测
-  # - 因此这里先关闭 Redis 的自动装配；后续需要启用 Redis 时，把下面 exclude 删掉即可
-  autoconfigure:
-    exclude:
-      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
-      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
-      - org.springframework.boot.autoconfigure.data.redis.RedisReactiveAutoConfiguration
-
-  # ==========================
-  # Redis（可选）
-  # ==========================
-  data:
-    redis:
-      host: localhost
-      port: 6379
-      database: 0
-      timeout: 5s
-      lettuce:
-        pool:
-          max-active: 8
-          max-idle: 8
-          min-idle: 0
-
-  # ==========================
-  # Spring AI - MCP Server 配置
-  # ==========================
+    name: mcp-server-db
   ai:
-    # 本项目作为“数据库 MCP Server”不依赖 OpenAI，这里默认关闭模型（none）
-    model:
-      chat: none
-      embedding: none
-      image: none
-      moderation: none
-      audio:
-        speech: none
-        transcription: none
-
     mcp:
       server:
         enabled: true
         name: db-mcp-server
-        version: 1.0.0
+        version: 1.1.0
         instructions: |
-          这是一个“多数据源数据库 MCP Server”，支持 PostgreSQL/MySQL/Oracle/SQLServer：
-          - db_list_data_sources：查看可用 dataSourceId
-          - db_list_tables：支持 keyword/limit/offset（schema 下表很多时必须分页/筛选）
-          - db_get_table_schema / db_get_table_schema_batch：获取表结构（建议生成 SQL 前先获取字段与备注）
-          - db_query_sql：只读查询（仅 SELECT）
-          - db_prepare_write_sql -> db_confirm_write_sql：写入两段式确认
+          多数据源数据库工具，支持 PostgreSQL/MySQL/Oracle/SQLServer。
+          先列出数据源和表，再获取结构；表结构含主键、外键和索引。
+          查询只接受安全解析后的 SELECT，所有对象须在 schema 白名单内。
+          所有已配置的数据源均可读取，写入由每个数据源的 allow-writes 控制。
+          写入通过 prepare 和 confirm 操作；confirm 需提供 approvalKey，或事先通过独立审批。
+          confirm=true 不是用户批准。token 绑定身份与会话，只能执行一次。
+          查询结果可能按行数、字节数或字段长度截断，请检查 limited 和 warnings。
+          长文本先查字符长度，再用 SUBSTRING/SUBSTR 按偏移分段读取，或使用文本查找、替换、正则及拆分函数提取所需内容。
+          PostgreSQL 拆行采用 FROM 表别名, string_to_table(字段, 分隔符) AS parts(part)，不添加 LATERAL；SQL Server 使用 CROSS APPLY STRING_SPLIT。
+          PostgreSQL JSON 字段可用 jsonb_path_exists/match/query/query_array/query_first 及其 _tz 变体筛选和提取；jsonb_path_query 也可用于 FROM 中拆成多行。
         type: SYNC
         protocol: STREAMABLE
         streamable-http:
           mcp-endpoint: /mcp
           keep-alive-interval: 15s
-          disallow-delete: true
+          disallow-delete: false
 
-# ==========================
-# 业务自定义配置：数据库工具能力
-# ==========================
 app:
-  # ==========================
-  # MCP keep-alive 优化（断连会话自动清理）
-  # ==========================
-  # 背景：
-  # - MCP SDK 默认 keep-alive 失败后只会打印告警，不会自动移除会话
-  # - 当 Codex/客户端异常断开时，服务端可能持续尝试 ping，导致日志刷屏与无效任务占用资源
-  # 本项目通过补丁逻辑：ping 失败/超时后主动关闭并移除会话，避免“僵尸会话”长期存在
+  security:
+    # 所有客户端 token 均未配置或为空白时，HTTP 无需 Authorization。
+    # 任意客户端配置 token 后，HTTP 必须提供匹配的 Bearer 密钥（至少 32 字符）。
+    # 所有已配置数据源均可读取；写入要求数据源 allow-writes=true，并使用 approval-key 审批。
+    clients:
+      local:
+        token: ${MCP_API_KEY:}
+    approval-key: ${MCP_APPROVAL_KEY:}
   mcp:
     keep-alive:
       enabled: true
-      # ping 发送超时时间（超过则认为连接异常并清理会话）
       ping-timeout: 20s
-      # ping 失败是否立即清理会话（建议 true）
       cleanup-on-failure: true
-
   db:
-    # 默认数据源ID（工具未传 dataSourceId 时使用）
     default-data-source: primary
-
-    # 多数据源配置：可同时配置多个不同类型数据库
     data-sources:
-      # PostgreSQL 示例（按需修改）
       primary:
-        # type 可选：不填则运行时通过 JDBC 元数据自动识别
         type: POSTGRESQL
-        url: jdbc:postgresql://localhost:5432/myList?currentSchema=public
-        username: postgres
-        password: 123456789
+        url: ${DB_URL:jdbc:postgresql://localhost:5432/myList?currentSchema=public}
+        username: ${DB_USERNAME:mcp_reader}
+        password: ${DB_PASSWORD:}
         driver-class-name: org.postgresql.Driver
-        default-schema: public
+        default-schema: ${DB_SCHEMA:public}
         allowed-schemas:
-          - public
-
-      # MySQL 示例（按需启用）
-      # mysql1:
-      #   type: MYSQL
-      #   url: jdbc:mysql://localhost:3306/test?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
-      #   username: root
-      #   password: 123456
-      #   driver-class-name: com.mysql.cj.jdbc.Driver
-      #   default-schema: test
-      #   allowed-schemas:
-      #     - test
-
-      # Oracle 示例（按需启用）
-      # oracle1:
-      #   type: ORACLE
-      #   url: jdbc:oracle:thin:@localhost:1521/orclpdb1
-      #   username: system
-      #   password: 123456
-      #   driver-class-name: oracle.jdbc.OracleDriver
-      #   default-schema: SYSTEM
-      #   allowed-schemas:
-      #     - SYSTEM
-
-      # SQLServer 示例（按需启用）
-      # mssql1:
-      #   type: SQLSERVER
-      #   url: jdbc:sqlserver://localhost:1433;databaseName=master;encrypt=false;trustServerCertificate=true
-      #   username: sa
-      #   password: 123456
-      #   driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
-      #   default-schema: dbo
-      #   allowed-schemas:
-      #     - dbo
-
-    # Druid 连接池全局默认参数（所有数据源共用）
+          - ${DB_SCHEMA:public}
+        allow-writes: false
     pool:
-      initial-size: 5
-      min-idle: 5
+      initial-size: 0
+      min-idle: 0
       max-active: 20
-      max-wait: 60s
-      validation-query: SELECT 1
+      max-wait: 10s
+      connect-timeout: 10s
+      socket-timeout: 35s
       test-while-idle: true
       test-on-borrow: false
       test-on-return: false
-
-    # 表结构缓存（减少系统表查询）
     schema-cache-ttl: 20m
     schema-cache-max-size: 5000
-
-    # 表/视图列表最大返回条数（db_list_tables 的分页上限保护）
     table-list-max-rows: 200
-
-    # 批量获取表结构：并发度与单次最大表数量
     schema-fetch-parallelism: 4
+    schema-queue-capacity: 200
     schema-batch-max-tables: 50
-
-    # 查询保护：最大返回行数
+    schema-batch-timeout: 35s
     query-max-rows: 500
-
-    # 待确认 SQL 的有效期
+    query-timeout-seconds: 30
+    query-fetch-size: 100
+    sql-max-length: 65536
+    result-max-bytes: 1048576
+    field-max-length: 16384
     pending-sql-ttl: 10m
-
-    # 是否允许执行 DDL（默认 false；开启需谨慎）
+    pending-sql-max-size: 1000
     allow-ddl: false
-
-mybatis-plus:
-  configuration:
-    map-underscore-to-camel-case: true
-    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    allow-full-table-write: false
+    audit-include-sql: false
 
 management:
-  health:
-    # 兜底：即使未来启用了 Redis 自动装配，也可以先避免健康检查强依赖 Redis
-    redis:
-      enabled: false
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,env,loggers,threaddump
+        include: health
   endpoint:
     health:
-      show-details: always
+      show-details: never
+  health:
+    db:
+      enabled: false

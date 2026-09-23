@@ -7,7 +7,6 @@ import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.mcp.server.common.autoconfigure.properties.McpServerStreamableHttpProperties;
-import org.springframework.stereotype.Component;
 import reactor.core.scheduler.Schedulers;
 
 import java.lang.reflect.Field;
@@ -45,7 +44,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   <li>服务端会话仅在客户端显式 DELETE 时移除；异常断开时会变成“僵尸会话”。</li>
  * </ul>
  */
-@Component
 public class McpKeepAliveCleaner {
 
     private static final Logger log = LoggerFactory.getLogger(McpKeepAliveCleaner.class);
@@ -96,7 +94,10 @@ public class McpKeepAliveCleaner {
 
         // 停止 SDK 自带 keep-alive，避免重复 ping + 重复日志
         // 注意：这里调用 stop() 而不是 shutdown()，避免把 Reactor 的 boundedElastic 全局调度器一并 dispose 掉
-        stopSdkKeepAliveIfPresent(provider);
+        if (!stopSdkKeepAliveIfPresent(provider)) {
+            log.warn("无法停止 SDK keep-alive，自定义清理器不启动，避免重复心跳。");
+            return;
+        }
 
         Duration interval = streamableHttpProperties.getKeepAliveInterval();
         if (interval == null || interval.isZero() || interval.isNegative()) {
@@ -140,8 +141,10 @@ public class McpKeepAliveCleaner {
     private void tick() {
         ConcurrentHashMap<String, McpStreamableServerSession> currentSessions = this.sessions;
         if (currentSessions == null || currentSessions.isEmpty()) {
+            pingInFlight.clear();
             return;
         }
+        pingInFlight.keySet().removeIf(id -> !currentSessions.containsKey(id));
 
         Duration timeout = Objects.requireNonNullElse(cleanupProperties.getPingTimeout(), Duration.ofSeconds(5));
 
@@ -217,18 +220,20 @@ public class McpKeepAliveCleaner {
         }
     }
 
-    private static void stopSdkKeepAliveIfPresent(WebMvcStreamableServerTransportProvider provider) {
+    private static boolean stopSdkKeepAliveIfPresent(WebMvcStreamableServerTransportProvider provider) {
         try {
             Field f = WebMvcStreamableServerTransportProvider.class.getDeclaredField("keepAliveScheduler");
             f.setAccessible(true);
             Object keepAliveScheduler = f.get(provider);
             if (keepAliveScheduler == null) {
-                return;
+                return true;
             }
             keepAliveScheduler.getClass().getMethod("stop").invoke(keepAliveScheduler);
+            return true;
         } catch (Exception e) {
             // 关闭失败不影响启动：最多回退到 SDK 默认行为
             log.debug("停止 SDK KeepAliveScheduler 失败（将回退为默认 keep-alive 行为）：{}", e.getMessage());
+            return false;
         }
     }
 

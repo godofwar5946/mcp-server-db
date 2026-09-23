@@ -1,92 +1,92 @@
 package org.example.db.service;
 
-import org.example.db.sql.SqlStatementInfo;
-
-import java.time.Duration;
-import java.time.Instant;
-import java.util.Map;
+import com.github.benmanes.caffeine.cache.*;
+import org.example.db.config.DbExplorerProperties;
+import org.example.db.sql.SqlUtils.CheckedSql;
+import org.springframework.stereotype.Component;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.time.*;
+import java.util.HexFormat;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * 待确认 SQL 存储（内存版）。
- * <p>
- * 工作流：
- * <ol>
- *   <li>prepare：生成 token + 保存 SQL</li>
- *   <li>confirm：用户确认后，用 token 取出 SQL 执行</li>
- * </ol>
- * <p>
- * 说明：
- * <ul>
- *   <li>为简单起见，这里用内存实现；如果你需要多实例部署，请替换为 Redis。</li>
- *   <li>每个 token 有 TTL，过期后自动失效。</li>
- * </ul>
- */
+@Component
 public class PendingSqlStore {
-
+    private final Cache<String, PendingSql> store;
     private final Duration ttl;
-    private final ConcurrentHashMap<String, PendingSql> store = new ConcurrentHashMap<>();
+    private final int maximumSize;
+    private final Clock clock;
 
-    public PendingSqlStore(Duration ttl) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public PendingSqlStore(DbExplorerProperties properties) {
+        this(properties.getPendingSqlTtl(), properties.getPendingSqlMaxSize(), Clock.systemUTC());
+    }
+
+    PendingSqlStore(Duration ttl, int maximumSize, Clock clock) {
+        this(ttl, maximumSize, clock, Ticker.systemTicker());
+    }
+
+    PendingSqlStore(Duration ttl, int maximumSize, Clock clock, Ticker ticker) {
         this.ttl = ttl;
+        this.maximumSize = maximumSize;
+        this.clock = clock;
+        store = Caffeine.newBuilder().ticker(ticker).expireAfter(new Expiry<String, PendingSql>() {
+                    @Override public long expireAfterCreate(String key, PendingSql value, long now) { return ttl.toNanos(); }
+                    @Override public long expireAfterUpdate(String key, PendingSql value, long now, long currentDuration) { return currentDuration; }
+                    @Override public long expireAfterRead(String key, PendingSql value, long now, long currentDuration) { return currentDuration; }
+                }).maximumSize(maximumSize)
+                .scheduler(Scheduler.systemScheduler()).build();
     }
 
-    public PendingSql create(String dataSourceId, String sql, SqlStatementInfo statementInfo) {
-        cleanupExpired();
-        String token = UUID.randomUUID().toString();
-        Instant now = Instant.now();
-        PendingSql pendingSql = new PendingSql(token, dataSourceId, sql, statementInfo, now, now.plus(ttl));
-        store.put(token, pendingSql);
-        return pendingSql;
+    public synchronized PendingSql create(String owner, String dataSourceId, CheckedSql sql) {
+        store.cleanUp();
+        if (store.estimatedSize() >= maximumSize) throw new IllegalStateException("待确认 SQL 已达容量上限，请稍后重试");
+        Instant now = clock.instant();
+        PendingSql pending = new PendingSql(UUID.randomUUID().toString(), owner, dataSourceId, sql,
+                hash(sql.sql()), now.plus(ttl), false);
+        store.put(pending.token(), pending);
+        return pending;
     }
 
-    public PendingSql get(String token) {
-        if (token == null || token.isBlank()) {
-            return null;
-        }
-        PendingSql pendingSql = store.get(token);
-        if (pendingSql == null) {
-            return null;
-        }
-        if (pendingSql.isExpired()) {
-            store.remove(token);
-            return null;
-        }
-        return pendingSql;
+    public PendingSql get(String token, String owner) {
+        PendingSql pending = preview(token);
+        if (!pending.owner().equals(owner)) throw invalid();
+        return pending;
     }
 
-    public PendingSql remove(String token) {
-        PendingSql pendingSql = store.remove(token);
-        if (pendingSql == null) {
-            return null;
+    public PendingSql preview(String token) {
+        PendingSql pending = token == null ? null : store.getIfPresent(token);
+        if (pending == null || !clock.instant().isBefore(pending.expiresAt())) {
+            if (token != null) store.invalidate(token);
+            throw invalid();
         }
-        return pendingSql.isExpired() ? null : pendingSql;
+        return pending;
     }
 
-    private void cleanupExpired() {
-        Instant now = Instant.now();
-        for (Map.Entry<String, PendingSql> entry : store.entrySet()) {
-            PendingSql value = entry.getValue();
-            if (value.expiresAt().isBefore(now)) {
-                store.remove(entry.getKey());
-            }
-        }
+    public PendingSql approve(String token, String sqlHash) {
+        PendingSql pending = preview(token);
+        if (!pending.sqlHash().equals(sqlHash)) throw new IllegalArgumentException("SQL 摘要不匹配，请重新查看审批内容");
+        PendingSql approved = new PendingSql(pending.token(), pending.owner(), pending.dataSourceId(), pending.sql(),
+                pending.sqlHash(), pending.expiresAt(), true);
+        if (!store.asMap().replace(token, pending, approved)) throw invalid();
+        return approved;
     }
 
-    /**
-     * 待确认 SQL 条目。
-     */
-    public record PendingSql(
-            String token,
-            String dataSourceId,
-            String sql,
-            SqlStatementInfo statementInfo,
-            Instant createdAt,
-            Instant expiresAt
-    ) {
-        public boolean isExpired() {
-            return Instant.now().isAfter(expiresAt);
-        }
+    public PendingSql consume(String token, String owner, boolean requireApproval) {
+        PendingSql pending = get(token, owner);
+        if (requireApproval && !pending.approved()) throw new SecurityException("SQL 尚未获用户批准");
+        if (!store.asMap().remove(token, pending)) throw invalid();
+        return pending;
     }
+
+    private static IllegalArgumentException invalid() { return new IllegalArgumentException("token 无效、已过期或不属于当前会话"); }
+
+    public static String hash(String value) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
+    }
+
+    public record PendingSql(String token, String owner, String dataSourceId, CheckedSql sql,
+                             String sqlHash, Instant expiresAt, boolean approved) {}
 }

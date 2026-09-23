@@ -4,7 +4,9 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -20,10 +22,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Configuration
 public class DbExecutorConfiguration {
 
-    @Bean(name = "schemaFetchExecutor", destroyMethod = "shutdown")
+    @Bean(name = "schemaFetchExecutor", destroyMethod = "shutdownNow")
     public ExecutorService schemaFetchExecutor(DbExplorerProperties properties) {
         int parallelism = Math.max(1, properties.getSchemaFetchParallelism());
-        return Executors.newFixedThreadPool(parallelism, new NamedThreadFactory("schema-fetch-"));
+        return new ThreadPoolExecutor(parallelism, parallelism, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(properties.getSchemaQueueCapacity()),
+                new NamedThreadFactory("schema-fetch-"), new ThreadPoolExecutor.AbortPolicy());
     }
 
     private static class NamedThreadFactory implements ThreadFactory {
